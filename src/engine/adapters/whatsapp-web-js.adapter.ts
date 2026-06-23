@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { Client, LocalAuth, MessageMedia, MessageTypes } from 'whatsapp-web.js';
+import { Client, LocalAuth, MessageMedia, MessageTypes, WAState } from 'whatsapp-web.js';
 import * as qrcode from 'qrcode';
 import * as path from 'path';
 import {
@@ -115,19 +115,21 @@ export interface WhatsAppWebJsConfig {
   };
 }
 
+const READY_RECONCILE_INTERVAL_MS = 2000;
+const READY_RECONCILE_TIMEOUT_MS = 90_000;
+
 /**
  * Optional pin for the WhatsApp Web client version. whatsapp-web.js 1.34.x can get stuck at
- * "authenticating" (the post-link sync never completes) when the auto-fetched WA-Web version is
- * incompatible (#251). Set WWEBJS_WEB_VERSION to a known-good version string (browse
- * https://github.com/wppconnect-team/wa-version) to pin it; WWEBJS_WEB_VERSION_REMOTE_PATH
+ * "authenticating" when the auto-fetched WA-Web version is incompatible (#251/#273). Set
+ * WWEBJS_WEB_VERSION to a known-good version string to pin it; WWEBJS_WEB_VERSION_REMOTE_PATH
  * overrides the URL template (use `{version}` as the placeholder) if you self-host the HTML.
- * Unset (or `latest`/`off`) keeps whatsapp-web.js's default auto-version behavior.
+ * Unset (or `latest`/`off`/`auto`) keeps whatsapp-web.js's default auto-version behavior.
  */
 export function resolveWebVersionPin():
   | { webVersion: string; webVersionCache: { type: 'remote'; remotePath: string } }
   | undefined {
   const version = process.env.WWEBJS_WEB_VERSION?.trim();
-  if (!version || version.toLowerCase() === 'off' || version.toLowerCase() === 'latest') {
+  if (!version || ['off', 'latest', 'auto'].includes(version.toLowerCase())) {
     return undefined;
   }
   const template =
@@ -184,6 +186,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   private phoneNumber: string | null = null;
   private pushName: string | null = null;
   private callbacks: EngineEventCallbacks = {};
+  private readyReconcileTimer: ReturnType<typeof setTimeout> | null = null;
+  private readyReconcileStartedAt = 0;
+  private readyReconcileProbeInFlight = false;
+  // Set once teardown begins so a late 'authenticated' can't resurrect a disconnecting adapter. Not
+  // reset — an adapter is single-use after teardown (the session creates a fresh one to reconnect).
+  private tearingDown = false;
 
   constructor(private readonly config: WhatsAppWebJsConfig) {
     super();
@@ -275,22 +283,25 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     });
 
     this.client.on('authenticated', () => {
+      // Only the first authentication starts the reconcile window. Ignore a re-fired 'authenticated'
+      // while already AUTHENTICATING (so it can't restart the 90s deadline), once READY/FAILED, or any
+      // time during/after teardown (so a late event can't resurrect a disconnecting adapter). The
+      // initial status is DISCONNECTED, so teardown is distinguished by the flag, not by DISCONNECTED.
+      if (
+        this.tearingDown ||
+        this.status === EngineStatus.AUTHENTICATING ||
+        this.status === EngineStatus.READY ||
+        this.status === EngineStatus.FAILED
+      ) {
+        return;
+      }
       this.setStatus(EngineStatus.AUTHENTICATING);
       this.qrCode = null;
+      this.scheduleReadyReconcile();
     });
 
     this.client.on('ready', () => {
-      try {
-        const info = this.client?.info;
-        this.phoneNumber = info?.wid?.user || null;
-        this.pushName = info?.pushname || null;
-        this.setStatus(EngineStatus.READY);
-        this.callbacks.onReady?.(this.phoneNumber || '', this.pushName || '');
-      } catch (error) {
-        this.logger.error('Error getting client info', String(error));
-        this.setStatus(EngineStatus.READY);
-        this.callbacks.onReady?.('', '');
-      }
+      this.markReadyFromClientInfo();
     });
 
     // eslint-disable-next-line @typescript-eslint/no-misused-promises
@@ -423,11 +434,13 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     });
 
     this.client.on('disconnected', reason => {
+      this.clearReadyReconcile();
       this.setStatus(EngineStatus.DISCONNECTED);
       this.callbacks.onDisconnected?.(reason);
     });
 
     this.client.on('auth_failure', (message?: string) => {
+      this.clearReadyReconcile();
       this.setStatus(EngineStatus.FAILED);
       // Authentication failure is terminal: the stored credentials are invalid and
       // reconnecting will not help — the operator must re-scan the QR code. Route it
@@ -436,51 +449,156 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     });
   }
 
+  private markReadyFromClientInfo(): void {
+    if ([EngineStatus.READY, EngineStatus.DISCONNECTED, EngineStatus.FAILED].includes(this.status)) return;
+    this.clearReadyReconcile();
+    try {
+      const info = this.client?.info;
+      this.phoneNumber = info?.wid?.user || null;
+      this.pushName = info?.pushname || null;
+      this.setStatus(EngineStatus.READY);
+      this.callbacks.onReady?.(this.phoneNumber || '', this.pushName || '');
+    } catch (error) {
+      this.logger.error('Error getting client info', String(error));
+      this.setStatus(EngineStatus.READY);
+      this.callbacks.onReady?.('', '');
+    }
+  }
+
+  private scheduleReadyReconcile(): void {
+    this.clearReadyReconcile();
+    this.readyReconcileStartedAt = Date.now();
+
+    const tick = (): void => {
+      if (!this.client || this.status !== EngineStatus.AUTHENTICATING) {
+        this.clearReadyReconcile();
+        return;
+      }
+
+      // Deadline checked at the TOP of every tick (not after the probe) so a slow/hung getState() — a
+      // wedged page can make it never resolve, the very #251/#273 condition — can't defeat the 90s ceiling.
+      if (Date.now() - this.readyReconcileStartedAt >= READY_RECONCILE_TIMEOUT_MS) {
+        this.logger.warn('Timed out waiting for WhatsApp Web runtime readiness after authentication');
+        this.clearReadyReconcile();
+        return;
+      }
+
+      // Schedule the next tick up front, independent of the probe, so a hung probe can never stall the
+      // loop. The probe runs fire-and-forget with at-most-one in flight: if the previous one is still
+      // pending (hung), skip this round — the loop keeps ticking and gives up at the deadline above.
+      this.readyReconcileTimer = setTimeout(tick, READY_RECONCILE_INTERVAL_MS);
+      this.readyReconcileTimer.unref?.();
+
+      if (this.readyReconcileProbeInFlight) return;
+      this.readyReconcileProbeInFlight = true;
+      void this.isClientRuntimeReady()
+        .then(ready => {
+          if (ready && this.client && this.status === EngineStatus.AUTHENTICATING) {
+            this.logger.warn('WhatsApp Web ready event was missed; reconciling from connected runtime state');
+            this.markReadyFromClientInfo();
+          }
+        })
+        .catch(error => this.logger.debug('Ready reconciliation probe failed', { error: String(error) }))
+        .finally(() => {
+          this.readyReconcileProbeInFlight = false;
+        });
+    };
+
+    this.readyReconcileTimer = setTimeout(tick, READY_RECONCILE_INTERVAL_MS);
+    this.readyReconcileTimer.unref?.();
+  }
+
+  private clearReadyReconcile(): void {
+    if (this.readyReconcileTimer) {
+      clearTimeout(this.readyReconcileTimer);
+      this.readyReconcileTimer = null;
+    }
+    this.readyReconcileStartedAt = 0;
+    this.readyReconcileProbeInFlight = false;
+  }
+
+  private async isClientRuntimeReady(): Promise<boolean> {
+    if (!this.client) return false;
+    if ((await this.client.getState()) !== WAState.CONNECTED) return false;
+    if (!this.client.info?.wid?.user) return false;
+
+    const page = (this.client as unknown as { pupPage?: { evaluate: <T>(fn: () => T) => Promise<T> } }).pupPage;
+    const hasWWebJS = await page?.evaluate(
+      () => typeof (window as unknown as { WWebJS?: unknown }).WWebJS !== 'undefined',
+    );
+    return hasWWebJS === true;
+  }
+
   private setStatus(status: EngineStatus): void {
     this.status = status;
     this.callbacks.onStateChanged?.(status);
     this.emit('stateChanged', status);
   }
 
-  async disconnect(): Promise<void> {
-    if (this.client) {
-      try {
-        // Use destroy instead of logout to preserve session data
-        // This allows reconnecting without needing to scan QR again
-        await this.client.destroy();
-      } catch (error) {
-        this.logger.warn('Destroy client failed:', String(error));
-        // Already destroyed or not initialized - ignore
-      }
-      this.client = null;
+  private beginClientTeardown(): Client | null {
+    const client = this.client;
+    if (!client) return null;
+
+    this.tearingDown = true;
+    this.clearReadyReconcile();
+    if (this.status !== EngineStatus.DISCONNECTED) {
       this.setStatus(EngineStatus.DISCONNECTED);
+    }
+
+    return client;
+  }
+
+  private finishClientTeardown(client: Client): void {
+    if (this.client === client) {
+      this.client = null;
+    }
+    this.clearReadyReconcile();
+  }
+
+  async disconnect(): Promise<void> {
+    const client = this.beginClientTeardown();
+    if (!client) return;
+
+    try {
+      // Use destroy instead of logout to preserve session data
+      // This allows reconnecting without needing to scan QR again
+      await client.destroy();
+    } catch (error) {
+      this.logger.warn('Destroy client failed:', String(error));
+      // Already destroyed or not initialized - ignore
+    } finally {
+      this.finishClientTeardown(client);
     }
   }
 
   async logout(): Promise<void> {
-    if (this.client) {
+    const client = this.beginClientTeardown();
+    if (!client) return;
+
+    try {
+      // Logout clears session data - user will need to scan QR again
+      await client.logout();
+    } catch (error) {
+      this.logger.warn('Logout failed:', String(error));
+      // Fall back to destroy if logout fails
       try {
-        // Logout clears session data - user will need to scan QR again
-        await this.client.logout();
-      } catch (error) {
-        this.logger.warn('Logout failed:', String(error));
-        // Fall back to destroy if logout fails
-        try {
-          await this.client.destroy();
-        } catch (destroyError) {
-          this.logger.warn('Client destroy also failed during logout fallback', String(destroyError));
-        }
+        await client.destroy();
+      } catch (destroyError) {
+        this.logger.warn('Client destroy also failed during logout fallback', String(destroyError));
       }
-      this.client = null;
-      this.setStatus(EngineStatus.DISCONNECTED);
+    } finally {
+      this.finishClientTeardown(client);
     }
   }
 
   async destroy(): Promise<void> {
-    if (this.client) {
-      await this.client.destroy();
-      this.client = null;
-      this.setStatus(EngineStatus.DISCONNECTED);
+    const client = this.beginClientTeardown();
+    if (!client) return;
+
+    try {
+      await client.destroy();
+    } finally {
+      this.finishClientTeardown(client);
     }
   }
 
@@ -491,7 +609,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
    * can't prevent the engine from being torn down and the status reset.
    */
   async forceDestroy(): Promise<void> {
-    const client = this.client;
+    const client = this.beginClientTeardown();
     if (!client) return;
 
     try {
@@ -508,10 +626,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       await client.destroy();
     } catch (err) {
       this.logger.warn('forceDestroy: client.destroy() failed after the kill (continuing)', { error: String(err) });
+    } finally {
+      this.finishClientTeardown(client);
     }
-
-    this.client = null;
-    this.setStatus(EngineStatus.DISCONNECTED);
   }
 
   getStatus(): EngineStatus {
