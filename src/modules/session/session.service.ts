@@ -1101,6 +1101,24 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           }
         });
       },
+      onMessageEdited: (message): void => {
+        if (!this.isLiveEngine(id, engine)) return;
+        this.logger.debug(`Message edited: ${message.messageId}`, {
+          sessionId: id,
+          messageId: message.messageId,
+          action: 'message_edited',
+        });
+
+        void this.messageRepository
+          .update({ sessionId: id, waMessageId: message.messageId }, { body: message.body })
+          .catch(err => {
+            this.logger.error(`Failed to update edited message: ${message.messageId}`, String(err));
+          });
+
+        const editedPayload = message as unknown as Record<string, unknown>;
+        void this.webhookService.dispatch(id, 'message.edited', editedPayload);
+        this.eventsGateway.emitMessageEdited(id, editedPayload);
+      },
       onDisconnected: (reason: string): void => {
         if (!this.isLiveEngine(id, engine)) return;
         this.logger.warn(`Session disconnected: ${reason}`, {

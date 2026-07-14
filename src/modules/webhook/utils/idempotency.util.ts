@@ -56,6 +56,9 @@ export function generateIdempotencyKey(event: string, data: Record<string, unkno
     case 'message.revoked':
       return `rev_${toStr(data.sessionId)}_${toStr(data.id ?? data.messageId)}`;
 
+    case 'message.edited':
+      return `edit_${toStr(data.sessionId)}_${toStr(data.messageId)}_${toStr(data.timestamp)}`;
+
     case 'message.reaction':
       // A reaction carries no unique id and is a read-modify-write of the message's reactions map; the
       // same sender can re-apply the same emoji over time (👍 → remove → 👍). Keying on

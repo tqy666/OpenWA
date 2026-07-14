@@ -2593,6 +2593,58 @@ describe('SessionService', () => {
     });
   });
 
+  // ── onMessageEdited ───────────────────────────────────────────────
+
+  describe('onMessageEdited callback', () => {
+    it('updates body and emits message.edited event', async () => {
+      const session = createMockSession();
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      (messageRepository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      await service.start('sess-uuid-1');
+
+      const initializeCall = mockEngine.initialize.mock.calls[0] as unknown[];
+      const callbacks = initializeCall[0] as {
+        onMessageEdited: (m: { messageId: string; chatId: string; body: string; senderId: string; timestamp: number }) => void;
+      };
+
+      const edited = {
+        messageId: 'WA_MSG_EDIT_1',
+        chatId: '123@c.us',
+        body: 'New edited text',
+        senderId: '123@c.us',
+        timestamp: 1700000005,
+      };
+
+      callbacks.onMessageEdited(edited);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(messageRepository.update).toHaveBeenCalledWith(
+        { sessionId: 'sess-uuid-1', waMessageId: 'WA_MSG_EDIT_1' },
+        { body: 'New edited text' },
+      );
+
+      expect(webhookService.dispatch).toHaveBeenCalledWith(
+        'sess-uuid-1',
+        'message.edited',
+        expect.objectContaining({
+          messageId: 'WA_MSG_EDIT_1',
+          body: 'New edited text',
+        }),
+      );
+
+      expect(eventsGateway.emitMessageEdited).toHaveBeenCalledWith(
+        'sess-uuid-1',
+        expect.objectContaining({
+          messageId: 'WA_MSG_EDIT_1',
+          body: 'New edited text',
+        }),
+      );
+    });
+  });
+
   // ── getActiveCount / isActive ─────────────────────────────────────
 
   describe('getActiveCount', () => {

@@ -1450,6 +1450,50 @@ describe('BaileysAdapter inbound fan-out', () => {
     expect(revoked.body).toBe('');
   });
 
+  it('EDIT protocolMessage: fires onMessageEdited and NOT onMessage', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+    const baileys = jest.requireMock('@whiskeysockets/baileys') as { getContentType: jest.Mock };
+    baileys.getContentType.mockReturnValue('protocolMessage');
+
+    const onMessage = jest.fn();
+    const onMessageEdited = jest.fn();
+    const adapter = newAdapter();
+    await adapter.initialize({ onMessage, onMessageEdited });
+    fakeSock.fire('messages.upsert', {
+      type: 'notify',
+      messages: [
+        {
+          key: { remoteJid: '628111@s.whatsapp.net', participant: '628111@s.whatsapp.net', fromMe: false, id: 'PROTO_EDIT' },
+          message: {
+            protocolMessage: {
+              key: { id: 'ORIGINAL_MSG_ID' },
+              type: 14, // MESSAGE_EDIT
+              editedMessage: { conversation: 'New edited message text' },
+            },
+          },
+          messageTimestamp: 1700000030,
+        },
+      ],
+    });
+    await new Promise(r => setImmediate(r));
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(onMessageEdited).toHaveBeenCalledTimes(1);
+    expect(fakeStore.put).not.toHaveBeenCalled();
+
+    const edited = onMessageEdited.mock.calls[0][0] as {
+      messageId: string;
+      chatId: string;
+      body: string;
+      senderId: string;
+      timestamp: number;
+    };
+    expect(edited.messageId).toBe('ORIGINAL_MSG_ID');
+    expect(edited.chatId).toBe('628111@c.us');
+    expect(edited.body).toBe('New edited message text');
+    expect(edited.senderId).toBe('628111@c.us');
+    expect(edited.timestamp).toBe(1700000030);
+  });
+
   it('reactionMessage: fires onMessageReaction and NOT onMessage', async () => {
     // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
     const baileys = jest.requireMock('@whiskeysockets/baileys') as { getContentType: jest.Mock };

@@ -1101,6 +1101,18 @@ export class BaileysAdapter implements IWhatsAppEngine {
           this.callbacks.onMessageRevoked?.(revoked);
           return;
         }
+        if (pm?.type === b.proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
+          const body = pm.editedMessage?.conversation || pm.editedMessage?.extendedTextMessage?.text || '';
+          const edited: EditedMessage = {
+            messageId: pm.key?.id ?? '',
+            chatId: this.sessionStore.toNeutralJid(remoteJid),
+            body,
+            senderId: this.sessionStore.toNeutralJid(msg.key.participant ?? remoteJid),
+            timestamp: this.toUnixSeconds(msg.messageTimestamp),
+          };
+          this.callbacks.onMessageEdited?.(edited);
+          return;
+        }
         // Other protocol messages (ephemeral, history sync, etc.) — skip silently.
         return;
       }
