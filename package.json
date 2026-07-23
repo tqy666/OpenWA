@@ -77,7 +77,7 @@
     "adm-zip": "^0.6.0",
     "archiver": "^8.0.0",
     "better-sqlite3": "^12.11.1",
-    "bullmq": "^5.80.10",
+    "bullmq": "^5.80.11",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
     "dockerode": "^5.0.1",
