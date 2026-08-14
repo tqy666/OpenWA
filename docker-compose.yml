@@ -97,6 +97,8 @@ services:
     expose:
       - '2785'
     environment:
+
+      - ENABLE_SWAGGER=true
       # Core
       - NODE_ENV=${NODE_ENV:-production}
       # Writable HOME on tmpfs so Chromium's HOME-relative writes don't hit the read_only rootfs
